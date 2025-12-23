@@ -13,11 +13,13 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFormLayout,
     QGroupBox,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSlider,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -49,11 +51,14 @@ class MRCTool(QWidget):
         self.mask_black_fg: Optional[np.ndarray] = None
         self.fg_bgr: Optional[np.ndarray] = None
         self.bg_bgr: Optional[np.ndarray] = None
+        self.recon_bgr: Optional[np.ndarray] = None
 
         # rendered pixmaps cache (avoid recompute on resize)
         self._mask_pix: Optional[QPixmap] = None
         self._fg_pix: Optional[QPixmap] = None
         self._bg_pix: Optional[QPixmap] = None
+        self._recon_pix: Optional[QPixmap] = None
+        self._src_pix: Optional[QPixmap] = None
 
         # controls
         self.method_combo = QComboBox()
@@ -98,6 +103,7 @@ class MRCTool(QWidget):
         self.btn_save_fg = QPushButton("Save FG (PNG/BMP)…")
         self.btn_save_fg_jpeg = QPushButton("Save FG (JPEG)…")
         self.btn_save_bg = QPushButton("Save BG (JPEG)…")
+        self.btn_reconstruct = QPushButton("Reconstruct image")
 
         self.btn_save_mask.setEnabled(False)
         self.btn_save_mask_jbig2.setEnabled(False)
@@ -105,6 +111,7 @@ class MRCTool(QWidget):
         self.btn_save_fg_jpeg.setEnabled(False)
         self.btn_save_bg.setEnabled(False)
         self.btn_save_mask_g4.setEnabled(False)
+        self.btn_reconstruct.setEnabled(False)
 
         # =================================================
         # FG color unification
@@ -126,13 +133,66 @@ class MRCTool(QWidget):
         fgf.addRow(self.cb_fg_unified)
         fgf.addRow("Color mode", self.fg_color_mode)
 
+        # =================================================
+        # Panel toggles + zoom
+        # =================================================
+        self.panel_group = QGroupBox("Panels")
+        pf = QFormLayout(self.panel_group)
+        self.cb_show_src = QCheckBox("Source")
+        self.cb_show_mask = QCheckBox("Mask")
+        self.cb_show_fg = QCheckBox("FG")
+        self.cb_show_bg = QCheckBox("BG")
+        self.cb_show_recon = QCheckBox("Reconstructed")
+        for cb in (
+            self.cb_show_src,
+            self.cb_show_mask,
+            self.cb_show_fg,
+            self.cb_show_bg,
+            self.cb_show_recon,
+        ):
+            cb.setChecked(True)
+        pf.addRow(self.cb_show_src)
+        pf.addRow(self.cb_show_mask)
+        pf.addRow(self.cb_show_fg)
+        pf.addRow(self.cb_show_bg)
+        pf.addRow(self.cb_show_recon)
+
+        self.zoom_group = QGroupBox("Zoom")
+        zf = QFormLayout(self.zoom_group)
+        self.zoom_slider = QSlider(Qt.Horizontal)
+        self.zoom_slider.setRange(5, 800)
+        self.zoom_slider.setValue(75)
+        self.zoom_value = QLabel("75%")
+        zf.addRow(self.zoom_slider)
+        zf.addRow("Value", self.zoom_value)
+
         # views
-        self.mask_view = QLabel("Mask (black = FG)")
-        self.fg_view = QLabel("FG (original pixels under mask)")
-        self.bg_view = QLabel("BG (original pixels outside mask)")
-        for v in (self.mask_view, self.fg_view, self.bg_view):
+        self.src_view = QLabel()
+        self.mask_view = QLabel()
+        self.fg_view = QLabel()
+        self.bg_view = QLabel()
+        self.recon_view = QLabel()
+        for v in (self.src_view, self.mask_view, self.fg_view, self.bg_view, self.recon_view):
             v.setAlignment(Qt.AlignCenter)
-            v.setMinimumSize(520, 640)
+            v.setMinimumSize(280, 360)
+
+        def make_view_panel(title: str, view: QLabel) -> QWidget:
+            panel = QWidget()
+            layout = QVBoxLayout(panel)
+            title_label = QLabel(title)
+            title_label.setAlignment(Qt.AlignCenter)
+            layout.addWidget(title_label)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(False)
+            scroll.setWidget(view)
+            layout.addWidget(scroll, 1)
+            return panel
+
+        self.src_panel = make_view_panel("Source", self.src_view)
+        self.mask_panel = make_view_panel("Mask (black = FG)", self.mask_view)
+        self.fg_panel = make_view_panel("FG (original pixels under mask)", self.fg_view)
+        self.bg_panel = make_view_panel("BG (original pixels outside mask)", self.bg_view)
+        self.recon_panel = make_view_panel("Reconstructed", self.recon_view)
 
         # layout left controls in scroll
         ctrl = QWidget()
@@ -151,22 +211,32 @@ class MRCTool(QWidget):
         cl.addWidget(self.bg_group)
         cl.addWidget(self.fg_group)
         cl.addWidget(self.fg_color_group)
+        cl.addWidget(self.panel_group)
+        cl.addWidget(self.zoom_group)
         cl.addWidget(self.btn_save_mask)
         cl.addWidget(self.btn_save_mask_jbig2)
         cl.addWidget(self.btn_save_fg)
         cl.addWidget(self.btn_save_fg_jpeg)
         cl.addWidget(self.btn_save_bg)
         cl.addWidget(self.btn_save_mask_g4)
+        cl.addWidget(self.btn_reconstruct)
         cl.addStretch(1)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(ctrl)
 
-        views = QHBoxLayout()
-        views.addWidget(self.mask_view)
-        views.addWidget(self.fg_view)
-        views.addWidget(self.bg_view)
+        views = QGridLayout()
+        views.addWidget(self.src_panel, 0, 0)
+        views.addWidget(self.mask_panel, 0, 1)
+        views.addWidget(self.fg_panel, 0, 2)
+        views.addWidget(self.bg_panel, 1, 0)
+        views.addWidget(self.recon_panel, 1, 1)
+        views.setRowStretch(0, 1)
+        views.setRowStretch(1, 1)
+        views.setColumnStretch(0, 1)
+        views.setColumnStretch(1, 1)
+        views.setColumnStretch(2, 1)
 
         main = QHBoxLayout(self)
         main.addWidget(scroll, 1)
@@ -180,6 +250,7 @@ class MRCTool(QWidget):
         self.btn_save_fg_jpeg.clicked.connect(self.save_fg_jpeg)
         self.btn_save_bg.clicked.connect(self.save_bg)
         self.btn_save_mask_g4.clicked.connect(self.save_mask_g4)
+        self.btn_reconstruct.clicked.connect(self.reconstruct_image)
 
         self.method_combo.currentIndexChanged.connect(self.rebuild_params)
         self.cb_open.stateChanged.connect(self.update_results)
@@ -190,6 +261,12 @@ class MRCTool(QWidget):
         self.fg_quality.valueChanged.connect(self.update_results)
         self.cb_fg_unified.stateChanged.connect(self.update_results)
         self.fg_color_mode.currentIndexChanged.connect(self.update_results)
+        self.cb_show_src.stateChanged.connect(self.update_results)
+        self.cb_show_mask.stateChanged.connect(self.update_results)
+        self.cb_show_fg.stateChanged.connect(self.update_results)
+        self.cb_show_bg.stateChanged.connect(self.update_results)
+        self.cb_show_recon.stateChanged.connect(self.update_results)
+        self.zoom_slider.valueChanged.connect(self._on_zoom_change)
 
         self.rebuild_params()
 
@@ -226,6 +303,9 @@ class MRCTool(QWidget):
 
         self.color = color
         self.gray = cv2.cvtColor(color, cv2.COLOR_BGR2GRAY)
+        self.recon_bgr = None
+        self._recon_pix = None
+        self.recon_view.clear()
 
         self.btn_save_mask.setEnabled(True)
         self.btn_save_mask_jbig2.setEnabled(True)
@@ -233,6 +313,7 @@ class MRCTool(QWidget):
         self.btn_save_fg_jpeg.setEnabled(True)
         self.btn_save_bg.setEnabled(True)
         self.btn_save_mask_g4.setEnabled(True)
+        self.btn_reconstruct.setEnabled(True)
 
         self.update_results()
 
@@ -253,6 +334,7 @@ class MRCTool(QWidget):
         return m
 
     def update_results(self):
+        self._apply_panel_visibility()
         if self.gray is None or self.color is None:
             return
 
@@ -260,51 +342,97 @@ class MRCTool(QWidget):
             params = self.gather_params()
             method = self.current_method()
 
-            mask_white = method.fn(self.gray, params)
-            mask_white = (mask_white > 0).astype(np.uint8) * 255
-            mask_white = self.refine_white_fg(mask_white)
+            show_src = self.cb_show_src.isChecked()
+            show_mask = self.cb_show_mask.isChecked()
+            show_fg = self.cb_show_fg.isChecked()
+            show_bg = self.cb_show_bg.isChecked()
+            show_recon = self.cb_show_recon.isChecked()
 
-            self.mask_black_fg = to_black_fg(mask_white)
-
-            # FG bitmap
-            if self.cb_fg_unified.isChecked():
-                mode = self.fg_color_mode.currentText()
-
-                if mode == "Block colors":
-                    self.fg_bgr = self.make_fg_block_colored(
-                        self.color,
-                        self.mask_black_fg
-                    )
-                else:
-                    self.fg_bgr = self.make_fg_unified(
-                        self.color,
-                        self.mask_black_fg,
-                        mode
-                    )
+            if show_src:
+                self._src_pix = QPixmap.fromImage(qimage_from_bgr(self.color))
             else:
-                # ORIGINAL FG: keep original pixels under mask
-                fg = np.full_like(self.color, 255)
-                fg[self.mask_black_fg == 0] = self.color[self.mask_black_fg == 0]
-                self.fg_bgr = fg
+                self._src_pix = None
+                self.src_view.clear()
 
-            # BG bitmap: keep original pixels where mask is WHITE, FG filled with white
-            self.bg_bgr = make_bg_image(self.color, self.mask_black_fg)
+            self.recon_bgr = None
+            self._recon_pix = None
+            self.recon_view.clear()
+
+            need_mask = show_mask or show_fg or show_bg or show_recon
+            need_fg = show_fg or show_recon
+            need_bg = show_bg or show_recon
+
+            if need_mask:
+                mask_white = method.fn(self.gray, params)
+                mask_white = (mask_white > 0).astype(np.uint8) * 255
+                mask_white = self.refine_white_fg(mask_white)
+                self.mask_black_fg = to_black_fg(mask_white)
+            else:
+                self.mask_black_fg = None
+                self._mask_pix = None
+                self.mask_view.clear()
+
+            if need_fg:
+                if self.mask_black_fg is None:
+                    return
+                if self.cb_fg_unified.isChecked():
+                    mode = self.fg_color_mode.currentText()
+
+                    if mode == "Block colors":
+                        self.fg_bgr = self.make_fg_block_colored(
+                            self.color,
+                            self.mask_black_fg
+                        )
+                    else:
+                        self.fg_bgr = self.make_fg_unified(
+                            self.color,
+                            self.mask_black_fg,
+                            mode
+                        )
+                else:
+                    # ORIGINAL FG: keep original pixels under mask
+                    fg = np.full_like(self.color, 255)
+                    fg[self.mask_black_fg == 0] = self.color[self.mask_black_fg == 0]
+                    self.fg_bgr = fg
+            else:
+                self.fg_bgr = None
+                self._fg_pix = None
+                self.fg_view.clear()
+
+            if need_bg:
+                if self.mask_black_fg is None:
+                    return
+                # BG bitmap: keep original pixels where mask is WHITE, FG filled with white
+                self.bg_bgr = make_bg_image(self.color, self.mask_black_fg)
+            else:
+                self.bg_bgr = None
+                self._bg_pix = None
+                self.bg_view.clear()
 
             # render pixmaps (scaled later in resize)
-            if self.mask_black_fg is not None:
+            if show_mask and self.mask_black_fg is not None:
                 self._mask_pix = QPixmap.fromImage(
                     qimage_from_gray(self.mask_black_fg)
                 )
+            elif not show_mask:
+                self._mask_pix = None
+                self.mask_view.clear()
 
-            if self.fg_bgr is not None:
+            if show_fg and self.fg_bgr is not None:
                 self._fg_pix = QPixmap.fromImage(
                     qimage_from_bgr(self.fg_bgr)
                 )
+            elif not show_fg:
+                self._fg_pix = None
+                self.fg_view.clear()
 
-            if self.bg_bgr is not None:
+            if show_bg and self.bg_bgr is not None:
                 self._bg_pix = QPixmap.fromImage(
                     qimage_from_bgr(self.bg_bgr)
                 )
+            elif not show_bg:
+                self._bg_pix = None
+                self.bg_view.clear()
 
             self._rescale_views()
 
@@ -312,22 +440,46 @@ class MRCTool(QWidget):
             QMessageBox.critical(self, "Processing error", str(e))
 
     def _rescale_views(self):
+        def scale_pix(pix: QPixmap) -> QPixmap:
+            factor = self._zoom_factor()
+            width = max(1, int(pix.width() * factor))
+            height = max(1, int(pix.height() * factor))
+            return pix.scaled(width, height, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+        if self._src_pix is not None:
+            scaled = scale_pix(self._src_pix)
+            self.src_view.setPixmap(scaled)
+            self.src_view.resize(scaled.size())
         if self._mask_pix is not None:
-            self.mask_view.setPixmap(self._mask_pix.scaled(
-                self.mask_view.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-            ))
+            scaled = scale_pix(self._mask_pix)
+            self.mask_view.setPixmap(scaled)
+            self.mask_view.resize(scaled.size())
         if self._fg_pix is not None:
-            self.fg_view.setPixmap(self._fg_pix.scaled(
-                self.fg_view.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-            ))
+            scaled = scale_pix(self._fg_pix)
+            self.fg_view.setPixmap(scaled)
+            self.fg_view.resize(scaled.size())
         if self._bg_pix is not None:
-            self.bg_view.setPixmap(self._bg_pix.scaled(
-                self.bg_view.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-            ))
+            scaled = scale_pix(self._bg_pix)
+            self.bg_view.setPixmap(scaled)
+            self.bg_view.resize(scaled.size())
+        if self._recon_pix is not None:
+            scaled = scale_pix(self._recon_pix)
+            self.recon_view.setPixmap(scaled)
+            self.recon_view.resize(scaled.size())
 
     def resizeEvent(self, event):  # noqa: N802 (Qt signature)
         super().resizeEvent(event)
         self._rescale_views()
+
+    def _apply_panel_visibility(self):
+        self.src_panel.setVisible(self.cb_show_src.isChecked())
+        self.mask_panel.setVisible(self.cb_show_mask.isChecked())
+        self.fg_panel.setVisible(self.cb_show_fg.isChecked())
+        self.bg_panel.setVisible(self.cb_show_bg.isChecked())
+        self.recon_panel.setVisible(self.cb_show_recon.isChecked())
+        self.btn_reconstruct.setEnabled(
+            self.cb_show_recon.isChecked() and self.color is not None
+        )
 
     def save_mask(self):
         if self.mask_black_fg is None:
@@ -386,6 +538,37 @@ class MRCTool(QWidget):
         if path:
             save_mask_tiff_g4(self.mask_black_fg, path)
 
+    def _zoom_factor(self) -> float:
+        return float(self.zoom_slider.value()) / 100.0
+
+    def _on_zoom_change(self):
+        self.zoom_value.setText(f"{self.zoom_slider.value()}%")
+        self._rescale_views()
+
+    def reconstruct_image(self):
+        if not self.cb_show_recon.isChecked():
+            return
+        if self.mask_black_fg is None or self.fg_bgr is None or self.bg_bgr is None:
+            QMessageBox.warning(self, "Reconstruct", "Open an image and compute FG/BG first.")
+            return
+
+        if self.bg_bgr.shape != self.fg_bgr.shape:
+            QMessageBox.warning(self, "Reconstruct", "FG and BG sizes differ.")
+            return
+        if self.bg_bgr.shape[:2] != self.mask_black_fg.shape:
+            QMessageBox.warning(self, "Reconstruct", "Mask size differs from FG/BG.")
+            return
+
+        # Invert to match convention: WHITE (255) = FG
+        mask_white_fg = (255 - self.mask_black_fg).astype(np.uint8)
+        fg_pixels = (mask_white_fg == 255)
+
+        recon = self.bg_bgr.copy()
+        recon[fg_pixels] = self.fg_bgr[fg_pixels]
+        self.recon_bgr = recon
+        self._recon_pix = QPixmap.fromImage(qimage_from_bgr(self.recon_bgr))
+        self._rescale_views()
+
     def make_fg_unified(self,
                         color_bgr: np.ndarray,
                         mask_black_fg: np.ndarray,
@@ -418,7 +601,7 @@ class MRCTool(QWidget):
                             min_area: int = 20) -> np.ndarray:
         """
         Create FG where each connected text component
-        is filled with its own representative color.
+        is represented by a solid colored rectangle.
         """
         fg = np.full_like(color_bgr, 255)
 
@@ -442,7 +625,12 @@ class MRCTool(QWidget):
             # robust for scanned text
             color = np.median(pixels, axis=0).astype(np.uint8)
 
-            fg[comp_mask] = color
+            x = stats[i, cv2.CC_STAT_LEFT]
+            y = stats[i, cv2.CC_STAT_TOP]
+            w = stats[i, cv2.CC_STAT_WIDTH]
+            h = stats[i, cv2.CC_STAT_HEIGHT]
+
+            fg[y:y + h, x:x + w] = color
 
         return fg
 
@@ -450,7 +638,7 @@ class MRCTool(QWidget):
 def main():
     app = QApplication(sys.argv)
     w = MRCTool()
-    w.resize(2000, 900)
+    w.resize(1800, 900)
     w.show()
     sys.exit(app.exec())
 
