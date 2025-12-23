@@ -16,6 +16,8 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -26,7 +28,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
 )
 
-from .image_utils import make_bg_image, qimage_from_bgr, qimage_from_gray, to_black_fg, ensure_odd
+from .image_utils import make_bg_image, qimage_from_bgr, qimage_from_gray, to_black_fg
 from .methods import METHODS
 from .save_utils import (
     save_bg_jpeg,
@@ -69,32 +71,16 @@ class MRCTool(QWidget):
         self.params_form = QFormLayout(self.params_group)
         self.param_widgets: Dict[str, LabeledSlider] = {}
 
-        self.refine_group = QGroupBox("Refinement (optional)")
-        rf = QFormLayout(self.refine_group)
-        self.cb_open = QCheckBox("Morph open (remove noise)")
-        self.cb_close = QCheckBox("Morph close (connect strokes)")
-        self.cb_dilate = QCheckBox("Dilate strokes")
-        self.refine_kernel = QSpinBox()
-        self.refine_kernel.setRange(1, 31)
-        self.refine_kernel.setValue(3)
-        rf.addRow(self.cb_open)
-        rf.addRow(self.cb_close)
-        rf.addRow(self.cb_dilate)
-        rf.addRow("Kernel size (odd)", self.refine_kernel)
-
-        self.bg_group = QGroupBox("BG save settings (MRC-style)")
-        bgf = QFormLayout(self.bg_group)
+        self.save_group = QGroupBox("Save settings (MRC-style)")
+        sgf = QFormLayout(self.save_group)
         self.bg_quality = QSpinBox()
         self.bg_quality.setRange(1, 100)
         self.bg_quality.setValue(40)
-        bgf.addRow("JPEG quality", self.bg_quality)
-
-        self.fg_group = QGroupBox("FG save settings (MRC-style)")
-        bgf = QFormLayout(self.fg_group)
         self.fg_quality = QSpinBox()
         self.fg_quality.setRange(1, 100)
         self.fg_quality.setValue(40)
-        bgf.addRow("JPEG quality", self.fg_quality)
+        sgf.addRow("BG JPEG quality", self.bg_quality)
+        sgf.addRow("FG JPEG quality", self.fg_quality)
 
         self.btn_open = QPushButton("Open image…")
         self.btn_save_mask = QPushButton("Save mask (PNG/BMP)…")
@@ -134,37 +120,31 @@ class MRCTool(QWidget):
         fgf.addRow("Color mode", self.fg_color_mode)
 
         # =================================================
-        # Panel toggles + zoom
+        # Panels (order + visibility) + zoom
         # =================================================
-        self.panel_group = QGroupBox("Panels")
-        pf = QFormLayout(self.panel_group)
-        self.cb_show_src = QCheckBox("Source")
-        self.cb_show_mask = QCheckBox("Mask")
-        self.cb_show_fg = QCheckBox("FG")
-        self.cb_show_bg = QCheckBox("BG")
-        self.cb_show_recon = QCheckBox("Reconstructed")
-        for cb in (
-            self.cb_show_src,
-            self.cb_show_mask,
-            self.cb_show_fg,
-            self.cb_show_bg,
-            self.cb_show_recon,
-        ):
-            cb.setChecked(True)
-        pf.addRow(self.cb_show_src)
-        pf.addRow(self.cb_show_mask)
-        pf.addRow(self.cb_show_fg)
-        pf.addRow(self.cb_show_bg)
-        pf.addRow(self.cb_show_recon)
-
-        self.zoom_group = QGroupBox("Zoom")
-        zf = QFormLayout(self.zoom_group)
+        self.zoom_widget = QWidget()
+        zf = QFormLayout(self.zoom_widget)
         self.zoom_slider = QSlider(Qt.Horizontal)
         self.zoom_slider.setRange(5, 800)
         self.zoom_slider.setValue(75)
         self.zoom_value = QLabel("75%")
         zf.addRow(self.zoom_slider)
         zf.addRow("Value", self.zoom_value)
+
+        self.order_group = QGroupBox("Panels")
+        of = QFormLayout(self.order_group)
+        self.panel_order = QListWidget()
+        for name in ("Source", "Mask", "FG", "BG", "Reconstructed"):
+            item = QListWidgetItem(name)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked)
+            self.panel_order.addItem(item)
+        self.btn_order_up = QPushButton("Move up")
+        self.btn_order_down = QPushButton("Move down")
+        of.addRow(self.panel_order)
+        of.addRow(self.btn_order_up)
+        of.addRow(self.btn_order_down)
+        of.addRow("Zoom", self.zoom_widget)
 
         # views
         self.src_view = QLabel()
@@ -176,6 +156,11 @@ class MRCTool(QWidget):
             v.setAlignment(Qt.AlignCenter)
             v.setMinimumSize(280, 360)
 
+        self._scroll_areas: list[QScrollArea] = []
+        self._scrollbar_map = {}
+        self._scroll_pos = {"x": 0, "y": 0}
+        self._syncing_scroll = False
+
         def make_view_panel(title: str, view: QLabel) -> QWidget:
             panel = QWidget()
             layout = QVBoxLayout(panel)
@@ -186,6 +171,7 @@ class MRCTool(QWidget):
             scroll.setWidgetResizable(False)
             scroll.setWidget(view)
             layout.addWidget(scroll, 1)
+            self._scroll_areas.append(scroll)
             return panel
 
         self.src_panel = make_view_panel("Source", self.src_view)
@@ -194,6 +180,13 @@ class MRCTool(QWidget):
         self.bg_panel = make_view_panel("BG (original pixels outside mask)", self.bg_view)
         self.recon_panel = make_view_panel("Reconstructed", self.recon_view)
 
+        self.panel_by_name = {
+            "Source": self.src_panel,
+            "Mask": self.mask_panel,
+            "FG": self.fg_panel,
+            "BG": self.bg_panel,
+            "Reconstructed": self.recon_panel,
+        }
         # layout left controls in scroll
         ctrl = QWidget()
         cl = QVBoxLayout(ctrl)
@@ -207,12 +200,9 @@ class MRCTool(QWidget):
         cl.addWidget(self.btn_open)
         cl.addWidget(top_group)
         cl.addWidget(self.params_group)
-        cl.addWidget(self.refine_group)
-        cl.addWidget(self.bg_group)
-        cl.addWidget(self.fg_group)
         cl.addWidget(self.fg_color_group)
-        cl.addWidget(self.panel_group)
-        cl.addWidget(self.zoom_group)
+        cl.addWidget(self.order_group)
+        cl.addWidget(self.save_group)
         cl.addWidget(self.btn_save_mask)
         cl.addWidget(self.btn_save_mask_jbig2)
         cl.addWidget(self.btn_save_fg)
@@ -226,21 +216,14 @@ class MRCTool(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setWidget(ctrl)
 
-        views = QGridLayout()
-        views.addWidget(self.src_panel, 0, 0)
-        views.addWidget(self.mask_panel, 0, 1)
-        views.addWidget(self.fg_panel, 0, 2)
-        views.addWidget(self.bg_panel, 1, 0)
-        views.addWidget(self.recon_panel, 1, 1)
-        views.setRowStretch(0, 1)
-        views.setRowStretch(1, 1)
-        views.setColumnStretch(0, 1)
-        views.setColumnStretch(1, 1)
-        views.setColumnStretch(2, 1)
+        self.views_container = QWidget()
+        self.views_layout = QGridLayout(self.views_container)
+        self.views_layout.setContentsMargins(0, 0, 0, 0)
+        self._rebuild_views_layout()
 
         main = QHBoxLayout(self)
         main.addWidget(scroll, 1)
-        main.addLayout(views, 4)
+        main.addWidget(self.views_container, 4)
 
         # signals
         self.btn_open.clicked.connect(self.open_image)
@@ -253,22 +236,57 @@ class MRCTool(QWidget):
         self.btn_reconstruct.clicked.connect(self.reconstruct_image)
 
         self.method_combo.currentIndexChanged.connect(self.rebuild_params)
-        self.cb_open.stateChanged.connect(self.update_results)
-        self.cb_close.stateChanged.connect(self.update_results)
-        self.cb_dilate.stateChanged.connect(self.update_results)
-        self.refine_kernel.valueChanged.connect(self.update_results)
         self.bg_quality.valueChanged.connect(self.update_results)
         self.fg_quality.valueChanged.connect(self.update_results)
         self.cb_fg_unified.stateChanged.connect(self.update_results)
         self.fg_color_mode.currentIndexChanged.connect(self.update_results)
-        self.cb_show_src.stateChanged.connect(self.update_results)
-        self.cb_show_mask.stateChanged.connect(self.update_results)
-        self.cb_show_fg.stateChanged.connect(self.update_results)
-        self.cb_show_bg.stateChanged.connect(self.update_results)
-        self.cb_show_recon.stateChanged.connect(self.update_results)
+        self.panel_order.itemChanged.connect(self.update_results)
         self.zoom_slider.valueChanged.connect(self._on_zoom_change)
+        self.btn_order_up.clicked.connect(self._move_panel_up)
+        self.btn_order_down.clicked.connect(self._move_panel_down)
+        self._wire_scroll_sync()
 
         self.rebuild_params()
+
+    def _wire_scroll_sync(self) -> None:
+        for scroll in self._scroll_areas:
+            vbar = scroll.verticalScrollBar()
+            hbar = scroll.horizontalScrollBar()
+            self._scrollbar_map[vbar] = (scroll, True)
+            self._scrollbar_map[hbar] = (scroll, False)
+            vbar.valueChanged.connect(self._on_scrollbar_changed)
+            hbar.valueChanged.connect(self._on_scrollbar_changed)
+
+    def _on_scrollbar_changed(self, value: int) -> None:
+        if self._syncing_scroll:
+            return
+        sender = self.sender()
+        info = self._scrollbar_map.get(sender)
+        if info is None:
+            return
+        source, vertical = info
+        self._sync_scroll(source, value, vertical=vertical)
+
+    def _sync_scroll(self, source: QScrollArea, value: int, *, vertical: bool) -> None:
+        key = "y" if vertical else "x"
+        self._scroll_pos[key] = int(value)
+        self._apply_scroll_pos_axis(exclude=source, vertical=vertical)
+
+    def _apply_scroll_pos_axis(self, *, exclude: Optional[QScrollArea], vertical: bool) -> None:
+        key = "y" if vertical else "x"
+        target = self._scroll_pos[key]
+        self._syncing_scroll = True
+        try:
+            for scroll in self._scroll_areas:
+                if scroll is exclude:
+                    continue
+                bar = scroll.verticalScrollBar() if vertical else scroll.horizontalScrollBar()
+                value = max(bar.minimum(), min(bar.maximum(), target))
+                if bar.value() == value:
+                    continue
+                bar.setValue(value)
+        finally:
+            self._syncing_scroll = False
 
     def current_method(self) -> MethodSpec:
         return METHODS[self.method_combo.currentIndex()]
@@ -320,19 +338,6 @@ class MRCTool(QWidget):
     def gather_params(self) -> Dict[str, Any]:
         return {k: w.value() for k, w in self.param_widgets.items()}
 
-    def refine_white_fg(self, mask_white_fg: np.ndarray) -> np.ndarray:
-        k = ensure_odd(int(self.refine_kernel.value()), 1)
-        se = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
-
-        m = mask_white_fg
-        if self.cb_open.isChecked():
-            m = cv2.morphologyEx(m, cv2.MORPH_OPEN, se)
-        if self.cb_close.isChecked():
-            m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, se)
-        if self.cb_dilate.isChecked():
-            m = cv2.dilate(m, se, iterations=1)
-        return m
-
     def update_results(self):
         self._apply_panel_visibility()
         if self.gray is None or self.color is None:
@@ -342,11 +347,11 @@ class MRCTool(QWidget):
             params = self.gather_params()
             method = self.current_method()
 
-            show_src = self.cb_show_src.isChecked()
-            show_mask = self.cb_show_mask.isChecked()
-            show_fg = self.cb_show_fg.isChecked()
-            show_bg = self.cb_show_bg.isChecked()
-            show_recon = self.cb_show_recon.isChecked()
+            show_src = self._panel_is_enabled("Source")
+            show_mask = self._panel_is_enabled("Mask")
+            show_fg = self._panel_is_enabled("FG")
+            show_bg = self._panel_is_enabled("BG")
+            show_recon = self._panel_is_enabled("Reconstructed")
 
             if show_src:
                 self._src_pix = QPixmap.fromImage(qimage_from_bgr(self.color))
@@ -365,7 +370,6 @@ class MRCTool(QWidget):
             if need_mask:
                 mask_white = method.fn(self.gray, params)
                 mask_white = (mask_white > 0).astype(np.uint8) * 255
-                mask_white = self.refine_white_fg(mask_white)
                 self.mask_black_fg = to_black_fg(mask_white)
             else:
                 self.mask_black_fg = None
@@ -449,37 +453,107 @@ class MRCTool(QWidget):
         if self._src_pix is not None:
             scaled = scale_pix(self._src_pix)
             self.src_view.setPixmap(scaled)
-            self.src_view.resize(scaled.size())
+            self.src_view.setFixedSize(scaled.size())
         if self._mask_pix is not None:
             scaled = scale_pix(self._mask_pix)
             self.mask_view.setPixmap(scaled)
-            self.mask_view.resize(scaled.size())
+            self.mask_view.setFixedSize(scaled.size())
         if self._fg_pix is not None:
             scaled = scale_pix(self._fg_pix)
             self.fg_view.setPixmap(scaled)
-            self.fg_view.resize(scaled.size())
+            self.fg_view.setFixedSize(scaled.size())
         if self._bg_pix is not None:
             scaled = scale_pix(self._bg_pix)
             self.bg_view.setPixmap(scaled)
-            self.bg_view.resize(scaled.size())
+            self.bg_view.setFixedSize(scaled.size())
         if self._recon_pix is not None:
             scaled = scale_pix(self._recon_pix)
             self.recon_view.setPixmap(scaled)
-            self.recon_view.resize(scaled.size())
+            self.recon_view.setFixedSize(scaled.size())
+        self._apply_scroll_pos_axis(exclude=None, vertical=True)
+        self._apply_scroll_pos_axis(exclude=None, vertical=False)
 
     def resizeEvent(self, event):  # noqa: N802 (Qt signature)
         super().resizeEvent(event)
         self._rescale_views()
 
     def _apply_panel_visibility(self):
-        self.src_panel.setVisible(self.cb_show_src.isChecked())
-        self.mask_panel.setVisible(self.cb_show_mask.isChecked())
-        self.fg_panel.setVisible(self.cb_show_fg.isChecked())
-        self.bg_panel.setVisible(self.cb_show_bg.isChecked())
-        self.recon_panel.setVisible(self.cb_show_recon.isChecked())
+        self.src_panel.setVisible(self._panel_is_enabled("Source"))
+        self.mask_panel.setVisible(self._panel_is_enabled("Mask"))
+        self.fg_panel.setVisible(self._panel_is_enabled("FG"))
+        self.bg_panel.setVisible(self._panel_is_enabled("BG"))
+        self.recon_panel.setVisible(self._panel_is_enabled("Reconstructed"))
         self.btn_reconstruct.setEnabled(
-            self.cb_show_recon.isChecked() and self.color is not None
+            self._panel_is_enabled("Reconstructed") and self.color is not None
         )
+        self._rebuild_views_layout()
+
+    def _panel_is_enabled(self, name: str) -> bool:
+        for i in range(self.panel_order.count()):
+            item = self.panel_order.item(i)
+            if item is not None and item.text() == name:
+                return item.checkState() == Qt.Checked
+        return False
+
+    def _panel_order_names(self) -> list[str]:
+        return [self.panel_order.item(i).text() for i in range(self.panel_order.count())]
+
+    def _ordered_visible_panels(self) -> list[QWidget]:
+        panels: list[QWidget] = []
+        for name in self._panel_order_names():
+            panel = self.panel_by_name.get(name)
+            if panel is None:
+                continue
+            if self._panel_is_enabled(name):
+                panels.append(panel)
+        return panels
+
+    def _rebuild_views_layout(self):
+        while self.views_layout.count():
+            item = self.views_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                self.views_layout.removeWidget(widget)
+
+        panels = self._ordered_visible_panels()
+        count = len(panels)
+        if count == 0:
+            return
+
+        cols = 1 if count == 1 else 2
+        row = 0
+        col = 0
+        for panel in panels:
+            self.views_layout.addWidget(panel, row, col)
+            col += 1
+            if col >= cols:
+                col = 0
+                row += 1
+
+        for r in range(row + 1):
+            self.views_layout.setRowStretch(r, 1)
+        for c in range(cols):
+            self.views_layout.setColumnStretch(c, 1)
+
+    def _move_panel_up(self):
+        row = self.panel_order.currentRow()
+        if row <= 0:
+            return
+        item = self.panel_order.takeItem(row)
+        self.panel_order.insertItem(row - 1, item)
+        self.panel_order.setCurrentRow(row - 1)
+        self._rebuild_views_layout()
+        self._rescale_views()
+
+    def _move_panel_down(self):
+        row = self.panel_order.currentRow()
+        if row < 0 or row >= self.panel_order.count() - 1:
+            return
+        item = self.panel_order.takeItem(row)
+        self.panel_order.insertItem(row + 1, item)
+        self.panel_order.setCurrentRow(row + 1)
+        self._rebuild_views_layout()
+        self._rescale_views()
 
     def save_mask(self):
         if self.mask_black_fg is None:
@@ -546,7 +620,7 @@ class MRCTool(QWidget):
         self._rescale_views()
 
     def reconstruct_image(self):
-        if not self.cb_show_recon.isChecked():
+        if not self._panel_is_enabled("Reconstructed"):
             return
         if self.mask_black_fg is None or self.fg_bgr is None or self.bg_bgr is None:
             QMessageBox.warning(self, "Reconstruct", "Open an image and compute FG/BG first.")
@@ -598,7 +672,7 @@ class MRCTool(QWidget):
     def make_fg_block_colored(self,
                             color_bgr: np.ndarray,
                             mask_black_fg: np.ndarray,
-                            min_area: int = 20) -> np.ndarray:
+                            min_area: int = 10) -> np.ndarray:
         """
         Create FG where each connected text component
         is represented by a solid colored rectangle.

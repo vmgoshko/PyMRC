@@ -143,6 +143,28 @@ def method_low_variance_filled(gray, p):
     return filled
 
 
+def method_mser_text(gray, p):
+    delta = int(p["delta"])
+    min_area = int(p["min_area"])
+    max_area = int(p["max_area"])
+    max_variation = float(p["max_variation"])
+    min_diversity = float(p["min_diversity"])
+    invert = int(p["invert"])
+
+    img = 255 - gray if invert else gray
+    mser = cv2.MSER_create(delta, min_area, max_area, max_variation, min_diversity)
+    regions, _ = mser.detectRegions(img)
+
+    mask = np.zeros_like(gray, dtype=np.uint8)
+    if not regions:
+        return mask
+
+    for region in regions:
+        poly = region.reshape(-1, 1, 2)
+        cv2.fillPoly(mask, [poly], 255)
+    return mask
+
+
 # =========================================================
 # Method registry (ALL kept)
 # =========================================================
@@ -208,4 +230,13 @@ METHODS: List[MethodSpec] = [
         ParamSpec("window", "Window size (odd)", "int", 3, 101, 31, 2),
         ParamSpec("stddev", "StdDev threshold", "float", 0.5, 50.0, 6.0, 0.1, 10),
     ], method_low_variance_filled),
+
+    MethodSpec("MSER text regions", [
+        ParamSpec("delta", "Delta", "int", 1, 20, 5, 1),
+        ParamSpec("min_area", "Min area", "int", 10, 10000, 60, 10),
+        ParamSpec("max_area", "Max area", "int", 100, 200000, 8000, 100),
+        ParamSpec("max_variation", "Max variation", "float", 0.1, 1.0, 0.25, 0.01, 100),
+        ParamSpec("min_diversity", "Min diversity", "float", 0.0, 1.0, 0.2, 0.01, 100),
+        ParamSpec("invert", "Invert (1=detect bright)", "int", 0, 1, 0, 1),
+    ], method_mser_text),
 ]
