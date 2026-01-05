@@ -1,4 +1,12 @@
-"""Saving helpers for masks and images."""
+"""
+Saving helpers for MRC layers.
+
+MRC is a compression-oriented representation, not image restoration.
+FG must preserve sharp edges; do not blur, inpaint, or smooth FG content.
+BG should be smooth/low-frequency and aggressively compressed (JPEG/JPEG2000).
+Mask must be strictly binary and pixel-perfect aligned with FG/BG.
+Improving BG visual quality at the expense of entropy is a bug.
+"""
 
 import os
 import subprocess
@@ -21,7 +29,7 @@ def save_bg_jpeg(bg_bgr: np.ndarray, out_path: str, quality: int = 40):
 
 
 def save_fg_jpeg(fg_bgr: np.ndarray, out_path: str, quality: int = 40):
-    # MRC-style: BG can be aggressively compressed because sharp stuff is in FG
+    # MRC-style: use only if a lossy FG is explicitly desired.
     cv2.imwrite(
         out_path,
         fg_bgr,
@@ -41,6 +49,8 @@ def save_mask_jbig2_via_gs(mask_black_fg: np.ndarray, out_path: str):
             f"Current: {GS_EXE}"
         )
 
+    if not np.isin(mask_black_fg, [0, 255]).all():
+        raise ValueError("Mask must be binary (0=FG, 255=BG).")
     bilevel = (mask_black_fg == 0).astype(np.uint8)  # 1 for FG/black
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -70,10 +80,28 @@ def save_mask_tiff_g4(mask_black_fg: np.ndarray, out_path: str):
     BLACK (0) = FG
     """
     # Convert to 1-bit image: FG=black(0), BG=white(255)
+    if not np.isin(mask_black_fg, [0, 255]).all():
+        raise ValueError("Mask must be binary (0=FG, 255=BG).")
     bilevel = (mask_black_fg == 0).astype(np.uint8) * 255
 
     img = Image.fromarray(bilevel, mode="L").convert("1")
 
+    img.save(
+        out_path,
+        format="TIFF",
+        compression="group4"
+    )
+
+
+def save_mask_tiff_g4_white_fg(mask_white_fg: np.ndarray, out_path: str):
+    """
+    Save binary mask as TIFF CCITT Group 4 (1-bit, lossless).
+    WHITE (255) = FG
+    """
+    if not np.isin(mask_white_fg, [0, 255]).all():
+        raise ValueError("Mask must be binary (0=BG, 255=FG).")
+    bilevel = (mask_white_fg > 0).astype(np.uint8) * 255
+    img = Image.fromarray(bilevel, mode="L").convert("1")
     img.save(
         out_path,
         format="TIFF",

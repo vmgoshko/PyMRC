@@ -1,6 +1,8 @@
 """Qt GUI for exploring mask candidates and saving results."""
 
 import sys
+import os
+import tempfile
 from typing import Any, Dict, Optional
 
 import cv2
@@ -9,7 +11,6 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QComboBox,
     QFormLayout,
     QGroupBox,
@@ -27,6 +28,7 @@ from PySide6.QtWidgets import (
     QWidget,
     QFileDialog,
 )
+from PIL import Image
 
 from .bg_fill import BG_FILL_BY_KEY, BG_FILL_SPECS, BgFillSpec
 from .image_utils import (
@@ -38,10 +40,9 @@ from .image_utils import (
 )
 from .methods import METHODS
 from .save_utils import (
-    save_bg_jpeg,
-    save_fg_jpeg,
     save_mask_jbig2_via_gs,
     save_mask_tiff_g4,
+    save_mask_tiff_g4_white_fg,
 )
 from .specs import MethodSpec
 from .widgets import LabeledSlider
@@ -61,6 +62,9 @@ class MRCTool(QWidget):
         self.fg_bgr: Optional[np.ndarray] = None
         self.bg_bgr: Optional[np.ndarray] = None
         self.recon_bgr: Optional[np.ndarray] = None
+        self.mask_black_fg_raw: Optional[np.ndarray] = None
+        self.fg_bgr_raw: Optional[np.ndarray] = None
+        self.bg_bgr_raw: Optional[np.ndarray] = None
 
         # rendered pixmaps cache (avoid recompute on resize)
         self._mask_pix: Optional[QPixmap] = None
@@ -78,50 +82,83 @@ class MRCTool(QWidget):
         self.params_form = QFormLayout(self.params_group)
         self.param_widgets: Dict[str, LabeledSlider] = {}
 
-        self.save_group = QGroupBox("Save settings (MRC-style)")
+        self.save_group = QGroupBox("Layer compression (MRC-style)")
         sgf = QFormLayout(self.save_group)
-        self.bg_quality = QSpinBox()
-        self.bg_quality.setRange(1, 100)
-        self.bg_quality.setValue(40)
-        self.fg_quality = QSpinBox()
-        self.fg_quality.setRange(1, 100)
-        self.fg_quality.setValue(40)
-        sgf.addRow("BG JPEG quality", self.bg_quality)
-        sgf.addRow("FG JPEG quality", self.fg_quality)
+
+        self.fg_format_combo = QComboBox()
+        self.fg_format_combo.addItem("JPEG", "JPEG")
+        self.fg_format_combo.addItem("PNG", "PNG")
+        self.fg_jpeg_label = QLabel("FG JPEG quality")
+        self.fg_jpeg_quality = QSpinBox()
+        self.fg_jpeg_quality.setRange(1, 100)
+        self.fg_jpeg_quality.setValue(40)
+        self.fg_png_label = QLabel("FG PNG level")
+        self.fg_png_level = QSpinBox()
+        self.fg_png_level.setRange(0, 9)
+        self.fg_png_level.setValue(3)
+        self.fg_size_label = QLabel("—")
+
+        self.bg_format_combo = QComboBox()
+        self.bg_format_combo.addItem("JPEG", "JPEG")
+        self.bg_format_combo.addItem("PNG", "PNG")
+        self.bg_jpeg_label = QLabel("BG JPEG quality")
+        self.bg_jpeg_quality = QSpinBox()
+        self.bg_jpeg_quality.setRange(1, 100)
+        self.bg_jpeg_quality.setValue(40)
+        self.bg_png_label = QLabel("BG PNG level")
+        self.bg_png_level = QSpinBox()
+        self.bg_png_level.setRange(0, 9)
+        self.bg_png_level.setValue(3)
+        self.bg_size_label = QLabel("—")
+
+        self.mask_format_combo = QComboBox()
+        self.mask_format_combo.addItem("TIFF G4", "TIFF_G4")
+        self.mask_size_label = QLabel("—")
+
+        for combo in (self.fg_format_combo, self.bg_format_combo, self.mask_format_combo):
+            combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(10)
+
+        sgf.addRow("FG format", self.fg_format_combo)
+        sgf.addRow(self.fg_jpeg_label, self.fg_jpeg_quality)
+        sgf.addRow(self.fg_png_label, self.fg_png_level)
+        sgf.addRow("FG size", self.fg_size_label)
+
+        sgf.addRow("BG format", self.bg_format_combo)
+        sgf.addRow(self.bg_jpeg_label, self.bg_jpeg_quality)
+        sgf.addRow(self.bg_png_label, self.bg_png_level)
+        sgf.addRow("BG size", self.bg_size_label)
+
+        sgf.addRow("Mask format", self.mask_format_combo)
+        sgf.addRow("Mask size", self.mask_size_label)
 
         self.bg_fill_group = QGroupBox("BG hole filling")
         bgf = QFormLayout(self.bg_fill_group)
-        self.cb_bg_fill = QCheckBox("Apply BG fill")
-        self.cb_bg_fill.setChecked(True)
         self.bg_fill_combo = QComboBox()
         self.bg_fill_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.bg_fill_combo.setMinimumContentsLength(12)
         for spec in BG_FILL_SPECS:
             self.bg_fill_combo.addItem(spec.label, spec.key)
-        bgf.addRow(self.cb_bg_fill)
         bgf.addRow("Fill method", self.bg_fill_combo)
         self.mask_post_group = QGroupBox("Mask post-processing")
         mpf = QFormLayout(self.mask_post_group)
-        self.cb_mask_dilate = QCheckBox("Dilate mask")
-        self.cb_mask_dilate.setChecked(False)
         self.mask_dilate_size = QSpinBox()
         self.mask_dilate_size.setRange(1, 51)
         self.mask_dilate_size.setValue(3)
         self.mask_dilate_iter = QSpinBox()
         self.mask_dilate_iter.setRange(1, 10)
         self.mask_dilate_iter.setValue(1)
-        mpf.addRow(self.cb_mask_dilate)
         mpf.addRow("Kernel size", self.mask_dilate_size)
         mpf.addRow("Iterations", self.mask_dilate_iter)
 
 
         self.btn_open = QPushButton("Open image…")
-        self.btn_save_mask = QPushButton("Save mask (PNG/BMP)…")
+        self.btn_save_mask = QPushButton("Save mask")
         self.btn_save_mask_jbig2 = QPushButton("Save mask (JBIG2)…")
         self.btn_save_mask_g4 = QPushButton("Save mask (TIFF G4)…")
-        self.btn_save_fg = QPushButton("Save FG (PNG/BMP)…")
+        self.btn_save_fg = QPushButton("Save FG")
         self.btn_save_fg_jpeg = QPushButton("Save FG (JPEG)…")
-        self.btn_save_bg = QPushButton("Save BG (JPEG)…")
+        self.btn_save_bg = QPushButton("Save BG")
         self.btn_reconstruct = QPushButton("Reconstruct image")
         self.btn_save_recon = QPushButton("Save reconstructed (PNG).")
 
@@ -133,15 +170,15 @@ class MRCTool(QWidget):
         self.btn_save_mask_g4.setEnabled(False)
         self.btn_reconstruct.setEnabled(False)
         self.btn_save_recon.setEnabled(False)
+        self.btn_save_mask_jbig2.setVisible(False)
+        self.btn_save_fg_jpeg.setVisible(False)
+        self.btn_save_mask_g4.setVisible(False)
 
         # =================================================
         # FG color unification
         # =================================================
         self.fg_color_group = QGroupBox("FG color mode")
         fgf = QFormLayout(self.fg_color_group)
-
-        self.cb_fg_unified = QCheckBox("Use unified FG color")
-        self.cb_fg_unified.setChecked(False)
 
         self.fg_color_mode = QComboBox()
         self.fg_color_mode.addItems([
@@ -159,7 +196,6 @@ class MRCTool(QWidget):
         self.fg_block_levels.setRange(2, 32)
         self.fg_block_levels.setValue(4)
 
-        fgf.addRow(self.cb_fg_unified)
         fgf.addRow("Color mode", self.fg_color_mode)
         fgf.addRow("Block size", self.fg_block_size)
         fgf.addRow("Luma levels", self.fg_block_levels)
@@ -251,11 +287,8 @@ class MRCTool(QWidget):
         cl.addWidget(self.bg_fill_group)
         cl.addWidget(self.save_group)
         cl.addWidget(self.btn_save_mask)
-        cl.addWidget(self.btn_save_mask_jbig2)
         cl.addWidget(self.btn_save_fg)
-        cl.addWidget(self.btn_save_fg_jpeg)
         cl.addWidget(self.btn_save_bg)
-        cl.addWidget(self.btn_save_mask_g4)
         cl.addWidget(self.btn_reconstruct)
         cl.addWidget(self.btn_save_recon)
         cl.addStretch(1)
@@ -285,22 +318,33 @@ class MRCTool(QWidget):
         self.btn_save_recon.clicked.connect(self.save_reconstructed)
 
         self.method_combo.currentIndexChanged.connect(self.rebuild_params)
-        self.bg_quality.valueChanged.connect(self.update_results)
-        self.fg_quality.valueChanged.connect(self.update_results)
-        self.cb_fg_unified.stateChanged.connect(self.update_results)
+        self.fg_format_combo.currentIndexChanged.connect(self._update_format_controls)
+        self.bg_format_combo.currentIndexChanged.connect(self._update_format_controls)
+        self.mask_format_combo.currentIndexChanged.connect(self.update_results)
+        self.fg_jpeg_quality.valueChanged.connect(self.update_results)
+        self.fg_png_level.valueChanged.connect(self.update_results)
+        self.bg_jpeg_quality.valueChanged.connect(self.update_results)
+        self.bg_png_level.valueChanged.connect(self.update_results)
+        self.fg_color_group.toggled.connect(self.update_results)
         self.fg_color_mode.currentIndexChanged.connect(self.update_results)
         self.fg_block_size.valueChanged.connect(self.update_results)
         self.fg_block_levels.valueChanged.connect(self.update_results)
-        self.cb_mask_dilate.stateChanged.connect(self.update_results)
+        self.mask_post_group.toggled.connect(self.update_results)
         self.mask_dilate_size.valueChanged.connect(self.update_results)
         self.mask_dilate_iter.valueChanged.connect(self.update_results)
-        self.cb_bg_fill.stateChanged.connect(self._on_bg_fill_toggle)
+        self.bg_fill_group.toggled.connect(self._on_bg_fill_toggle)
         self.bg_fill_combo.currentIndexChanged.connect(self.update_results)
         self.panel_order.itemChanged.connect(self.update_results)
         self.zoom_slider.valueChanged.connect(self._on_zoom_change)
         self.btn_order_up.clicked.connect(self._move_panel_up)
         self.btn_order_down.clicked.connect(self._move_panel_down)
         self._wire_scroll_sync()
+
+        self.fg_color_group.setChecked(False)
+        self.mask_post_group.setChecked(False)
+        self.bg_fill_group.setChecked(True)
+        self.save_group.setChecked(True)
+        self.save_group.toggled.connect(self.update_results)
 
         for group in (
             self.top_group,
@@ -313,12 +357,12 @@ class MRCTool(QWidget):
         ):
             self._make_group_collapsible(group)
 
+        self._update_format_controls()
         self._on_bg_fill_toggle()
         self.rebuild_params()
 
     def _make_group_collapsible(self, group: QGroupBox) -> None:
         group.setCheckable(True)
-        group.setChecked(True)
         layout = group.layout()
         if layout is None:
             return
@@ -346,8 +390,21 @@ class MRCTool(QWidget):
                     if widget is not None:
                         widget.setVisible(visible)
 
-        set_items_visible(True)
+        set_items_visible(group.isChecked())
         group.toggled.connect(set_items_visible)
+
+    def _set_row_visible(self, label: QLabel, widget: QWidget, visible: bool) -> None:
+        label.setVisible(visible)
+        widget.setVisible(visible)
+
+    def _update_format_controls(self) -> None:
+        fg_is_jpeg = self.fg_format_combo.currentData() == "JPEG"
+        bg_is_jpeg = self.bg_format_combo.currentData() == "JPEG"
+        self._set_row_visible(self.fg_jpeg_label, self.fg_jpeg_quality, fg_is_jpeg)
+        self._set_row_visible(self.fg_png_label, self.fg_png_level, not fg_is_jpeg)
+        self._set_row_visible(self.bg_jpeg_label, self.bg_jpeg_quality, bg_is_jpeg)
+        self._set_row_visible(self.bg_png_label, self.bg_png_level, not bg_is_jpeg)
+        self.update_results()
 
     def _wire_scroll_sync(self) -> None:
         for scroll in self._scroll_areas:
@@ -397,9 +454,104 @@ class MRCTool(QWidget):
         return BG_FILL_BY_KEY.get(key, BG_FILL_SPECS[0])
 
     def _on_bg_fill_toggle(self) -> None:
-        enabled = self.cb_bg_fill.isChecked()
+        enabled = self.bg_fill_group.isChecked()
         self.bg_fill_combo.setEnabled(enabled)
         self.update_results()
+
+    def _format_size_text(self, size_bytes: Optional[int]) -> str:
+        if size_bytes is None:
+            return "-"
+        return f"{size_bytes / 1024.0:.1f} KB"
+
+    def _encode_decode_color(self,
+                             bgr: np.ndarray,
+                             fmt: str,
+                             jpeg_quality: int,
+                             png_level: int) -> tuple[Optional[np.ndarray], Optional[int]]:
+        with tempfile.TemporaryDirectory() as tmp:
+            if fmt == "JPEG":
+                ext = ".jpg"
+                params = [cv2.IMWRITE_JPEG_QUALITY, int(jpeg_quality), cv2.IMWRITE_JPEG_OPTIMIZE, 1]
+            else:
+                ext = ".png"
+                params = [cv2.IMWRITE_PNG_COMPRESSION, int(png_level)]
+            path = os.path.join(tmp, f"layer{ext}")
+            ok = cv2.imwrite(path, bgr, params)
+            if not ok:
+                return None, None
+            size = os.path.getsize(path)
+            decoded = cv2.imread(path, cv2.IMREAD_COLOR)
+            return decoded, size
+
+    def _encode_decode_mask(self, mask_black_fg: np.ndarray) -> tuple[Optional[np.ndarray], Optional[int]]:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "mask.tif")
+            # TIFF expects inverted convention: black=BG, white=FG.
+            mask_white_fg = (255 - mask_black_fg).astype(np.uint8)
+            save_mask_tiff_g4_white_fg(mask_white_fg, path)
+            size = os.path.getsize(path)
+            img = Image.open(path).convert("L")
+            arr = np.array(img)
+            mask_white_fg = (arr > 127).astype(np.uint8) * 255
+            mask_black_fg_rt = (255 - mask_white_fg).astype(np.uint8)
+            return mask_black_fg_rt, size
+
+    def _apply_runtime_compression(self) -> None:
+        if not self.save_group.isChecked():
+            self.fg_bgr = self.fg_bgr_raw
+            self.bg_bgr = self.bg_bgr_raw
+            self.mask_black_fg = self.mask_black_fg_raw
+            self.fg_size_label.setText("-")
+            self.bg_size_label.setText("-")
+            self.mask_size_label.setText("-")
+            return
+
+        fg_size = None
+        bg_size = None
+        mask_size = None
+
+        if self.fg_bgr_raw is not None:
+            fmt = self.fg_format_combo.currentData()
+            decoded, fg_size = self._encode_decode_color(
+                self.fg_bgr_raw,
+                fmt,
+                int(self.fg_jpeg_quality.value()),
+                int(self.fg_png_level.value()),
+            )
+            if self.save_group.isChecked() and decoded is not None:
+                self.fg_bgr = decoded
+            else:
+                self.fg_bgr = self.fg_bgr_raw
+        else:
+            self.fg_bgr = None
+
+        if self.bg_bgr_raw is not None:
+            fmt = self.bg_format_combo.currentData()
+            decoded, bg_size = self._encode_decode_color(
+                self.bg_bgr_raw,
+                fmt,
+                int(self.bg_jpeg_quality.value()),
+                int(self.bg_png_level.value()),
+            )
+            if self.save_group.isChecked() and decoded is not None:
+                self.bg_bgr = decoded
+            else:
+                self.bg_bgr = self.bg_bgr_raw
+        else:
+            self.bg_bgr = None
+
+        if self.mask_black_fg_raw is not None:
+            decoded, mask_size = self._encode_decode_mask(self.mask_black_fg_raw)
+            if self.save_group.isChecked() and decoded is not None:
+                self.mask_black_fg = decoded
+            else:
+                self.mask_black_fg = self.mask_black_fg_raw
+        else:
+            self.mask_black_fg = None
+
+        self.fg_size_label.setText(self._format_size_text(fg_size))
+        self.bg_size_label.setText(self._format_size_text(bg_size))
+        self.mask_size_label.setText(self._format_size_text(mask_size))
 
     def rebuild_params(self):
         while self.params_form.rowCount():
@@ -436,11 +588,8 @@ class MRCTool(QWidget):
         self.recon_view.clear()
 
         self.btn_save_mask.setEnabled(True)
-        self.btn_save_mask_jbig2.setEnabled(True)
         self.btn_save_fg.setEnabled(True)
-        self.btn_save_fg_jpeg.setEnabled(True)
         self.btn_save_bg.setEnabled(True)
-        self.btn_save_mask_g4.setEnabled(True)
         self.btn_reconstruct.setEnabled(True)
         self.btn_save_recon.setEnabled(True)
 
@@ -452,6 +601,9 @@ class MRCTool(QWidget):
     def update_results(self):
         self._apply_panel_visibility()
         if self.gray is None or self.color is None:
+            self.fg_size_label.setText("-")
+            self.bg_size_label.setText("-")
+            self.mask_size_label.setText("-")
             return
 
         try:
@@ -478,68 +630,85 @@ class MRCTool(QWidget):
             need_fg = show_fg or show_recon
             need_bg = show_bg or show_recon
 
+            mask_black_fg_raw = None
             if need_mask:
                 mask_white = method.fn(self.gray, params)
                 mask_white = (mask_white > 0).astype(np.uint8) * 255
-                if self.cb_mask_dilate.isChecked():
+                if self.mask_post_group.isChecked():
                     k = ensure_odd(int(self.mask_dilate_size.value()), 1)
                     it = int(self.mask_dilate_iter.value())
                     se = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
                     mask_white = cv2.dilate(mask_white, se, iterations=it)
-                self.mask_black_fg = to_black_fg(mask_white)
+                mask_black_fg_raw = to_black_fg(mask_white)
             else:
                 self.mask_black_fg = None
+                self.mask_black_fg_raw = None
                 self._mask_pix = None
                 self.mask_view.clear()
 
+            fg_raw = None
             if need_fg:
-                if self.mask_black_fg is None:
+                if mask_black_fg_raw is None:
                     return
-                if self.cb_fg_unified.isChecked():
+                if self.fg_color_group.isChecked():
                     mode = self.fg_color_mode.currentText()
 
                     if mode == "Block colors":
-                        self.fg_bgr = self.make_fg_block_colored(
+                        fg_raw = self.make_fg_block_colored(
                             self.color,
-                            self.mask_black_fg
+                            mask_black_fg_raw
                         )
                     elif mode == "Posterized blocks":
-                        self.fg_bgr = self.make_fg_posterized_blocks(
+                        fg_raw = self.make_fg_posterized_blocks(
                             self.color,
-                            self.mask_black_fg,
+                            mask_black_fg_raw,
                             block=int(self.fg_block_size.value()),
                             levels=int(self.fg_block_levels.value())
                         )
                     else:
-                        self.fg_bgr = self.make_fg_unified(
+                        fg_raw = self.make_fg_unified(
                             self.color,
-                            self.mask_black_fg,
+                            mask_black_fg_raw,
                             mode
                         )
                 else:
+                    # FG must preserve edges; do not blur, inpaint, or smooth.
                     # ORIGINAL FG: keep original pixels under mask
                     fg = np.full_like(self.color, 255)
-                    fg[self.mask_black_fg == 0] = self.color[self.mask_black_fg == 0]
-                    self.fg_bgr = fg
+                    fg[mask_black_fg_raw == 0] = self.color[mask_black_fg_raw == 0]
+                    fg_raw = fg
             else:
                 self.fg_bgr = None
+                self.fg_bgr_raw = None
                 self._fg_pix = None
                 self.fg_view.clear()
 
+            bg_raw = None
             if need_bg:
-                if self.mask_black_fg is None:
+                if mask_black_fg_raw is None:
                     return
                 # BG bitmap: keep original pixels where mask is WHITE, fill FG holes
-                if self.cb_bg_fill.isChecked():
-                    fg_mask = (self.mask_black_fg == 0).astype(np.uint8) * 255
+                if self.bg_fill_group.isChecked():
+                    # BG should remain smooth/low-frequency for compression efficiency.
+                    fg_mask = (mask_black_fg_raw == 0).astype(np.uint8) * 255
                     fill = self.current_bg_fill()
-                    self.bg_bgr = fill.fn(self.color, fg_mask)
+                    bg_raw = fill.fn(self.color, fg_mask)
                 else:
-                    self.bg_bgr = make_bg_image(self.color, self.mask_black_fg)
+                    bg_raw = make_bg_image(self.color, mask_black_fg_raw)
             else:
                 self.bg_bgr = None
+                self.bg_bgr_raw = None
                 self._bg_pix = None
                 self.bg_view.clear()
+
+            if need_mask:
+                self.mask_black_fg_raw = mask_black_fg_raw
+            if need_fg:
+                self.fg_bgr_raw = fg_raw
+            if need_bg:
+                self.bg_bgr_raw = bg_raw
+            if need_mask or need_fg or need_bg:
+                self._apply_runtime_compression()
 
             # render pixmaps (scaled later in resize)
             if show_mask and self.mask_black_fg is not None:
@@ -684,52 +853,86 @@ class MRCTool(QWidget):
         self._rescale_views()
 
     def save_mask(self):
-        if self.mask_black_fg is None:
+        src = self.mask_black_fg_raw if self.mask_black_fg_raw is not None else self.mask_black_fg
+        if src is None:
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save mask", "mask.png", "PNG (*.png);;BMP (*.bmp)"
+            self, "Save mask (TIFF G4)", "mask.tif", "TIFF (*.tif *.tiff)"
         )
         if path:
-            cv2.imwrite(path, self.mask_black_fg)
+            inverted = (255 - src).astype(np.uint8)
+            save_mask_tiff_g4_white_fg(inverted, path)
 
     def save_mask_jbig2(self):
-        if self.mask_black_fg is None:
+        src = self.mask_black_fg_raw if self.mask_black_fg_raw is not None else self.mask_black_fg
+        if src is None:
             return
         path, _ = QFileDialog.getSaveFileName(
             self, "Save mask (JBIG2)", "mask.jb2", "JBIG2 (*.jb2)"
         )
         if path:
-            save_mask_jbig2_via_gs(self.mask_black_fg, path)
+            save_mask_jbig2_via_gs(src, path)
 
     def save_fg(self):
-        if self.fg_bgr is None:
+        src = self.fg_bgr_raw if self.fg_bgr_raw is not None else self.fg_bgr
+        if src is None:
             return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save FG", "fg.png", "PNG (*.png);;BMP (*.bmp)"
-        )
+        fmt = self.fg_format_combo.currentData()
+        if fmt == "JPEG":
+            default_name = "fg.jpg"
+            flt = "JPEG (*.jpg *.jpeg)"
+            params = [
+                cv2.IMWRITE_JPEG_QUALITY, int(self.fg_jpeg_quality.value()),
+                cv2.IMWRITE_JPEG_OPTIMIZE, 1,
+            ]
+        else:
+            default_name = "fg.png"
+            flt = "PNG (*.png)"
+            params = [cv2.IMWRITE_PNG_COMPRESSION, int(self.fg_png_level.value())]
+        path, _ = QFileDialog.getSaveFileName(self, "Save FG", default_name, flt)
         if path:
-            cv2.imwrite(path, self.fg_bgr)
+            cv2.imwrite(path, src, params)
 
     def save_bg(self):
-        if self.bg_bgr is None:
+        src = self.bg_bgr_raw if self.bg_bgr_raw is not None else self.bg_bgr
+        if src is None:
             return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save BG (JPEG)", "bg.jpg", "JPEG (*.jpg *.jpeg)"
-        )
+        fmt = self.bg_format_combo.currentData()
+        if fmt == "JPEG":
+            default_name = "bg.jpg"
+            flt = "JPEG (*.jpg *.jpeg)"
+            params = [
+                cv2.IMWRITE_JPEG_QUALITY, int(self.bg_jpeg_quality.value()),
+                cv2.IMWRITE_JPEG_OPTIMIZE, 1,
+            ]
+        else:
+            default_name = "bg.png"
+            flt = "PNG (*.png)"
+            params = [cv2.IMWRITE_PNG_COMPRESSION, int(self.bg_png_level.value())]
+        path, _ = QFileDialog.getSaveFileName(self, "Save BG", default_name, flt)
         if path:
-            save_bg_jpeg(self.bg_bgr, path, quality=int(self.bg_quality.value()))
+            cv2.imwrite(path, src, params)
 
     def save_fg_jpeg(self):
-        if self.fg_bgr is None:
+        src = self.fg_bgr_raw if self.fg_bgr_raw is not None else self.fg_bgr
+        if src is None:
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save BG (JPEG)", "fg.jpg", "JPEG (*.jpg *.jpeg)"
+            self, "Save FG (JPEG)", "fg.jpg", "JPEG (*.jpg *.jpeg)"
         )
         if path:
-            save_fg_jpeg(self.fg_bgr, path, quality=int(self.fg_quality.value()))
+            cv2.imwrite(
+                path,
+                src,
+                [
+                    cv2.IMWRITE_JPEG_QUALITY, int(self.fg_jpeg_quality.value()),
+                    cv2.IMWRITE_JPEG_OPTIMIZE, 1,
+                ],
+            )
 
     def save_mask_g4(self):
-        if self.mask_black_fg is None:
+        src = self.mask_black_fg_raw if self.mask_black_fg_raw is not None else self.mask_black_fg
+        if src is None:
             return
         path, _ = QFileDialog.getSaveFileName(
             self,
@@ -738,7 +941,8 @@ class MRCTool(QWidget):
             "TIFF (*.tif *.tiff)"
         )
         if path:
-            save_mask_tiff_g4(self.mask_black_fg, path)
+            inverted = (255 - src).astype(np.uint8)
+            save_mask_tiff_g4_white_fg(inverted, path)
 
     def save_reconstructed(self):
         if self.recon_bgr is None:
@@ -767,13 +971,13 @@ class MRCTool(QWidget):
         if self.bg_bgr.shape != self.fg_bgr.shape:
             QMessageBox.warning(self, "Reconstruct", "FG and BG sizes differ.")
             return
+        # Mask must align pixel-perfectly with FG/BG.
         if self.bg_bgr.shape[:2] != self.mask_black_fg.shape:
             QMessageBox.warning(self, "Reconstruct", "Mask size differs from FG/BG.")
             return
 
-        # Invert to match convention: WHITE (255) = FG
-        mask_white_fg = (255 - self.mask_black_fg).astype(np.uint8)
-        fg_pixels = (mask_white_fg == 255)
+        # Reconstruction uses BLACK (0) = FG, WHITE (255) = BG.
+        fg_pixels = (self.mask_black_fg == 0)
 
         recon = self.bg_bgr.copy()
         recon[fg_pixels] = self.fg_bgr[fg_pixels]

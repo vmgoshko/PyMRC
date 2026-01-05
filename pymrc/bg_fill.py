@@ -1,4 +1,9 @@
-"""Background hole-filling algorithms for the BG layer."""
+"""
+Background hole-filling algorithms for the BG layer.
+
+BG should remain smooth/low-frequency; visual realism is not the goal.
+Avoid introducing texture or edge detail that hurts compression.
+"""
 
 from __future__ import annotations
 
