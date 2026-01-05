@@ -28,7 +28,14 @@ from PySide6.QtWidgets import (
     QFileDialog,
 )
 
-from .image_utils import make_bg_image, qimage_from_bgr, qimage_from_gray, to_black_fg
+from .bg_fill import BG_FILL_BY_KEY, BG_FILL_SPECS, BgFillSpec
+from .image_utils import (
+    ensure_odd,
+    make_bg_image,
+    qimage_from_bgr,
+    qimage_from_gray,
+    to_black_fg,
+)
 from .methods import METHODS
 from .save_utils import (
     save_bg_jpeg,
@@ -82,6 +89,32 @@ class MRCTool(QWidget):
         sgf.addRow("BG JPEG quality", self.bg_quality)
         sgf.addRow("FG JPEG quality", self.fg_quality)
 
+        self.bg_fill_group = QGroupBox("BG hole filling")
+        bgf = QFormLayout(self.bg_fill_group)
+        self.cb_bg_fill = QCheckBox("Apply BG fill")
+        self.cb_bg_fill.setChecked(True)
+        self.bg_fill_combo = QComboBox()
+        self.bg_fill_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.bg_fill_combo.setMinimumContentsLength(12)
+        for spec in BG_FILL_SPECS:
+            self.bg_fill_combo.addItem(spec.label, spec.key)
+        bgf.addRow(self.cb_bg_fill)
+        bgf.addRow("Fill method", self.bg_fill_combo)
+        self.mask_post_group = QGroupBox("Mask post-processing")
+        mpf = QFormLayout(self.mask_post_group)
+        self.cb_mask_dilate = QCheckBox("Dilate mask")
+        self.cb_mask_dilate.setChecked(False)
+        self.mask_dilate_size = QSpinBox()
+        self.mask_dilate_size.setRange(1, 51)
+        self.mask_dilate_size.setValue(3)
+        self.mask_dilate_iter = QSpinBox()
+        self.mask_dilate_iter.setRange(1, 10)
+        self.mask_dilate_iter.setValue(1)
+        mpf.addRow(self.cb_mask_dilate)
+        mpf.addRow("Kernel size", self.mask_dilate_size)
+        mpf.addRow("Iterations", self.mask_dilate_iter)
+
+
         self.btn_open = QPushButton("Open image…")
         self.btn_save_mask = QPushButton("Save mask (PNG/BMP)…")
         self.btn_save_mask_jbig2 = QPushButton("Save mask (JBIG2)…")
@@ -90,6 +123,7 @@ class MRCTool(QWidget):
         self.btn_save_fg_jpeg = QPushButton("Save FG (JPEG)…")
         self.btn_save_bg = QPushButton("Save BG (JPEG)…")
         self.btn_reconstruct = QPushButton("Reconstruct image")
+        self.btn_save_recon = QPushButton("Save reconstructed (PNG).")
 
         self.btn_save_mask.setEnabled(False)
         self.btn_save_mask_jbig2.setEnabled(False)
@@ -98,6 +132,7 @@ class MRCTool(QWidget):
         self.btn_save_bg.setEnabled(False)
         self.btn_save_mask_g4.setEnabled(False)
         self.btn_reconstruct.setEnabled(False)
+        self.btn_save_recon.setEnabled(False)
 
         # =================================================
         # FG color unification
@@ -113,11 +148,21 @@ class MRCTool(QWidget):
             "Median FG color",
             "Mean FG color",
             "Forced black",
-            "Block colors"
+            "Block colors",
+            "Posterized blocks"
         ])
+
+        self.fg_block_size = QSpinBox()
+        self.fg_block_size.setRange(2, 128)
+        self.fg_block_size.setValue(8)
+        self.fg_block_levels = QSpinBox()
+        self.fg_block_levels.setRange(2, 32)
+        self.fg_block_levels.setValue(4)
 
         fgf.addRow(self.cb_fg_unified)
         fgf.addRow("Color mode", self.fg_color_mode)
+        fgf.addRow("Block size", self.fg_block_size)
+        fgf.addRow("Luma levels", self.fg_block_levels)
 
         # =================================================
         # Panels (order + visibility) + zoom
@@ -193,15 +238,17 @@ class MRCTool(QWidget):
         cl.setContentsMargins(10, 10, 10, 10)
         cl.setSpacing(10)
 
-        top_group = QGroupBox("Candidate mask method")
-        tf = QFormLayout(top_group)
+        self.top_group = QGroupBox("Candidate mask method")
+        tf = QFormLayout(self.top_group)
         tf.addRow("Method", self.method_combo)
 
         cl.addWidget(self.btn_open)
-        cl.addWidget(top_group)
+        cl.addWidget(self.top_group)
         cl.addWidget(self.params_group)
         cl.addWidget(self.fg_color_group)
         cl.addWidget(self.order_group)
+        cl.addWidget(self.mask_post_group)
+        cl.addWidget(self.bg_fill_group)
         cl.addWidget(self.save_group)
         cl.addWidget(self.btn_save_mask)
         cl.addWidget(self.btn_save_mask_jbig2)
@@ -210,6 +257,7 @@ class MRCTool(QWidget):
         cl.addWidget(self.btn_save_bg)
         cl.addWidget(self.btn_save_mask_g4)
         cl.addWidget(self.btn_reconstruct)
+        cl.addWidget(self.btn_save_recon)
         cl.addStretch(1)
 
         scroll = QScrollArea()
@@ -234,19 +282,72 @@ class MRCTool(QWidget):
         self.btn_save_bg.clicked.connect(self.save_bg)
         self.btn_save_mask_g4.clicked.connect(self.save_mask_g4)
         self.btn_reconstruct.clicked.connect(self.reconstruct_image)
+        self.btn_save_recon.clicked.connect(self.save_reconstructed)
 
         self.method_combo.currentIndexChanged.connect(self.rebuild_params)
         self.bg_quality.valueChanged.connect(self.update_results)
         self.fg_quality.valueChanged.connect(self.update_results)
         self.cb_fg_unified.stateChanged.connect(self.update_results)
         self.fg_color_mode.currentIndexChanged.connect(self.update_results)
+        self.fg_block_size.valueChanged.connect(self.update_results)
+        self.fg_block_levels.valueChanged.connect(self.update_results)
+        self.cb_mask_dilate.stateChanged.connect(self.update_results)
+        self.mask_dilate_size.valueChanged.connect(self.update_results)
+        self.mask_dilate_iter.valueChanged.connect(self.update_results)
+        self.cb_bg_fill.stateChanged.connect(self._on_bg_fill_toggle)
+        self.bg_fill_combo.currentIndexChanged.connect(self.update_results)
         self.panel_order.itemChanged.connect(self.update_results)
         self.zoom_slider.valueChanged.connect(self._on_zoom_change)
         self.btn_order_up.clicked.connect(self._move_panel_up)
         self.btn_order_down.clicked.connect(self._move_panel_down)
         self._wire_scroll_sync()
 
+        for group in (
+            self.top_group,
+            self.params_group,
+            self.fg_color_group,
+            self.order_group,
+            self.mask_post_group,
+            self.bg_fill_group,
+            self.save_group,
+        ):
+            self._make_group_collapsible(group)
+
+        self._on_bg_fill_toggle()
         self.rebuild_params()
+
+    def _make_group_collapsible(self, group: QGroupBox) -> None:
+        group.setCheckable(True)
+        group.setChecked(True)
+        layout = group.layout()
+        if layout is None:
+            return
+
+        def set_items_visible(visible: bool) -> None:
+            if isinstance(layout, QFormLayout):
+                for row in range(layout.rowCount()):
+                    for role in (
+                        QFormLayout.LabelRole,
+                        QFormLayout.FieldRole,
+                        QFormLayout.SpanningRole,
+                    ):
+                        item = layout.itemAt(row, role)
+                        if item is None:
+                            continue
+                        widget = item.widget()
+                        if widget is not None:
+                            widget.setVisible(visible)
+            else:
+                for i in range(layout.count()):
+                    item = layout.itemAt(i)
+                    if item is None:
+                        continue
+                    widget = item.widget()
+                    if widget is not None:
+                        widget.setVisible(visible)
+
+        set_items_visible(True)
+        group.toggled.connect(set_items_visible)
 
     def _wire_scroll_sync(self) -> None:
         for scroll in self._scroll_areas:
@@ -291,6 +392,15 @@ class MRCTool(QWidget):
     def current_method(self) -> MethodSpec:
         return METHODS[self.method_combo.currentIndex()]
 
+    def current_bg_fill(self) -> BgFillSpec:
+        key = self.bg_fill_combo.currentData()
+        return BG_FILL_BY_KEY.get(key, BG_FILL_SPECS[0])
+
+    def _on_bg_fill_toggle(self) -> None:
+        enabled = self.cb_bg_fill.isChecked()
+        self.bg_fill_combo.setEnabled(enabled)
+        self.update_results()
+
     def rebuild_params(self):
         while self.params_form.rowCount():
             self.params_form.removeRow(0)
@@ -332,6 +442,7 @@ class MRCTool(QWidget):
         self.btn_save_bg.setEnabled(True)
         self.btn_save_mask_g4.setEnabled(True)
         self.btn_reconstruct.setEnabled(True)
+        self.btn_save_recon.setEnabled(True)
 
         self.update_results()
 
@@ -370,6 +481,11 @@ class MRCTool(QWidget):
             if need_mask:
                 mask_white = method.fn(self.gray, params)
                 mask_white = (mask_white > 0).astype(np.uint8) * 255
+                if self.cb_mask_dilate.isChecked():
+                    k = ensure_odd(int(self.mask_dilate_size.value()), 1)
+                    it = int(self.mask_dilate_iter.value())
+                    se = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+                    mask_white = cv2.dilate(mask_white, se, iterations=it)
                 self.mask_black_fg = to_black_fg(mask_white)
             else:
                 self.mask_black_fg = None
@@ -386,6 +502,13 @@ class MRCTool(QWidget):
                         self.fg_bgr = self.make_fg_block_colored(
                             self.color,
                             self.mask_black_fg
+                        )
+                    elif mode == "Posterized blocks":
+                        self.fg_bgr = self.make_fg_posterized_blocks(
+                            self.color,
+                            self.mask_black_fg,
+                            block=int(self.fg_block_size.value()),
+                            levels=int(self.fg_block_levels.value())
                         )
                     else:
                         self.fg_bgr = self.make_fg_unified(
@@ -406,8 +529,13 @@ class MRCTool(QWidget):
             if need_bg:
                 if self.mask_black_fg is None:
                     return
-                # BG bitmap: keep original pixels where mask is WHITE, FG filled with white
-                self.bg_bgr = make_bg_image(self.color, self.mask_black_fg)
+                # BG bitmap: keep original pixels where mask is WHITE, fill FG holes
+                if self.cb_bg_fill.isChecked():
+                    fg_mask = (self.mask_black_fg == 0).astype(np.uint8) * 255
+                    fill = self.current_bg_fill()
+                    self.bg_bgr = fill.fn(self.color, fg_mask)
+                else:
+                    self.bg_bgr = make_bg_image(self.color, self.mask_black_fg)
             else:
                 self.bg_bgr = None
                 self._bg_pix = None
@@ -612,6 +740,16 @@ class MRCTool(QWidget):
         if path:
             save_mask_tiff_g4(self.mask_black_fg, path)
 
+    def save_reconstructed(self):
+        if self.recon_bgr is None:
+            QMessageBox.warning(self, "Save reconstructed", "Reconstruct image first.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save reconstructed (PNG)", "reconstructed.png", "PNG (*.png)"
+        )
+        if path:
+            cv2.imwrite(path, self.recon_bgr)
+
     def _zoom_factor(self) -> float:
         return float(self.zoom_slider.value()) / 100.0
 
@@ -708,6 +846,50 @@ class MRCTool(QWidget):
 
         return fg
 
+    def make_fg_posterized_blocks(self,
+                                  color_bgr: np.ndarray,
+                                  mask_black_fg: np.ndarray,
+                                  block: int = 8,
+                                  levels: int = 4) -> np.ndarray:
+        """
+        Create FG from block rectangles with quantized luma (posterized).
+        """
+        fg = np.full_like(color_bgr, 255)
+        fg_mask = (mask_black_fg == 0)
+        if not fg_mask.any():
+            return fg
+
+        block = max(2, int(block))
+        levels = max(2, int(levels))
+        step = 255.0 / float(levels - 1)
+
+        ycrcb = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2YCrCb)
+        h, w = fg_mask.shape
+
+        for y in range(0, h, block):
+            y2 = min(h, y + block)
+            for x in range(0, w, block):
+                x2 = min(w, x + block)
+                block_mask = fg_mask[y:y2, x:x2]
+                if not block_mask.any():
+                    continue
+
+                pixels = ycrcb[y:y2, x:x2][block_mask]
+                mean = pixels.mean(axis=0)
+                qy = int(round(mean[0] / step) * step)
+                qy = int(max(0, min(255, qy)))
+
+                qycrcb = np.array(
+                    [[[qy, mean[1], mean[2]]]],
+                    dtype=np.float32
+                )
+                qycrcb_u8 = np.clip(qycrcb, 0, 255).astype(np.uint8)
+                q_bgr = cv2.cvtColor(qycrcb_u8, cv2.COLOR_YCrCb2BGR)[0, 0]
+
+                fg_block = fg[y:y2, x:x2]
+                fg_block[block_mask] = q_bgr
+
+        return fg
 
 def main():
     app = QApplication(sys.argv)

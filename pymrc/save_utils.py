@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from .config import GS_EXE
+GS_EXE = os.environ.get("GS_EXE", "")
 
 
 def save_bg_jpeg(bg_bgr: np.ndarray, out_path: str, quality: int = 40):
