@@ -111,10 +111,10 @@ def fill_bg_inpaint_telea(bg_image: np.ndarray, fg_mask: np.ndarray) -> np.ndarr
 
 
 BG_FILL_SPECS: List[BgFillSpec] = [
-    BgFillSpec("FLAT_MEAN", "Flat mean (default)", fill_bg_flat_mean),
-    BgFillSpec("LOCAL_MEAN", "Local mean", fill_bg_local_mean),
     BgFillSpec("DIFFUSION", "Diffusion", fill_bg_diffusion),
-    BgFillSpec("INPAINT_TELEA", "Inpaint (Telea) - not for production MRC", fill_bg_inpaint_telea),
+    BgFillSpec("FLAT_MEAN", "Flat mean", fill_bg_flat_mean),
+    BgFillSpec("LOCAL_MEAN", "Local mean", fill_bg_local_mean),
+    BgFillSpec("INPAINT_TELEA", "Inpaint (Telea)", fill_bg_inpaint_telea),
 ]
 
 BG_FILL_BY_KEY: Dict[str, BgFillSpec] = {spec.key: spec for spec in BG_FILL_SPECS}

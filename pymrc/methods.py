@@ -5,7 +5,7 @@ from typing import Any, Dict, List
 import cv2
 import numpy as np
 
-from .image_utils import clamp_u8, ensure_odd
+from .image_utils import ensure_odd
 from .specs import MethodSpec, ParamSpec
 
 
@@ -54,6 +54,25 @@ def method_sauvola(gray, p):
     return (f < th).astype(np.uint8) * 255  # dark -> FG
 
 
+def auto_tune_sauvola(gray: np.ndarray) -> tuple[int, float]:
+    """
+    Heuristic auto-tuning for document scans (compression-oriented).
+    Conservative text detection is preferred over clean background.
+    """
+    h, w = gray.shape[:2]
+    base = int(round(min(h, w) / 30.0))
+    base = max(21, min(81, base))
+    window = ensure_odd(base, 21)
+    if window > 81:
+        window = 81
+
+    std = float(gray.std())
+    k = 0.25 + 0.20 * max(0.0, min(1.0, std / 64.0))
+    # Slight positive bias to avoid losing thin strokes.
+    k = min(0.45, k + 0.02)
+    return window, k
+
+
 def method_niblack(gray, p):
     win = ensure_odd(int(p["window"]), 3)
     k = float(p["k"])
@@ -65,104 +84,88 @@ def method_niblack(gray, p):
     return (f < th).astype(np.uint8) * 255  # dark -> FG
 
 
-def method_sobel_edges(gray, p):
-    k = ensure_odd(int(p["kernel"]), 3)
-    t = int(p["threshold"])
-    sx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=k)
-    sy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=k)
-    mag = cv2.magnitude(sx, sy)
-    mag = clamp_u8(mag / (mag.max() + 1e-6) * 255.0)
-    _, m = cv2.threshold(mag, t, 255, cv2.THRESH_BINARY)
-    return m
-
-
-def method_laplacian(gray, p):
-    t = int(p["threshold"])
-    lap = np.abs(cv2.Laplacian(gray, cv2.CV_32F, ksize=3))
-    lap = clamp_u8(lap / (lap.max() + 1e-6) * 255.0)
-    _, m = cv2.threshold(lap, t, 255, cv2.THRESH_BINARY)
-    return m
-
-
-def method_dog(gray, p):
-    s1 = float(p["sigma1"])
-    s2 = float(p["sigma2"])
-    t = int(p["threshold"])
-    g1 = cv2.GaussianBlur(gray, (0, 0), s1)
-    g2 = cv2.GaussianBlur(gray, (0, 0), s2)
-    dog = clamp_u8(cv2.absdiff(g1, g2))
-    _, m = cv2.threshold(dog, t, 255, cv2.THRESH_BINARY)
-    return m
-
-
 def method_canny(gray, p):
     low = int(p["low"])
     high = int(p["high"])
     return cv2.Canny(gray, low, high)
 
 
-def method_morph_gradient(gray, p):
-    k = ensure_odd(int(p["kernel"]), 3)
-    t = int(p["threshold"])
-    se = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
-    grad = cv2.morphologyEx(gray, cv2.MORPH_GRADIENT, se)
-    _, m = cv2.threshold(grad, t, 255, cv2.THRESH_BINARY)
-    return m
-
-
-def method_top_percent_energy(gray, p):
-    pct = float(p["percent"])
-    lap = np.abs(cv2.Laplacian(gray, cv2.CV_32F, ksize=3))
-    lap = lap / (lap.max() + 1e-6) * 255.0
-    lap = clamp_u8(lap)
-    cut = np.percentile(lap, 100.0 - pct)
-    return (lap >= cut).astype(np.uint8) * 255
-
-
-def method_low_variance_filled(gray, p):
+def detect_text_mask(gray: np.ndarray, p: Dict[str, Any]) -> np.ndarray:
     """
-    Low-variance filled geometry detector.
-    Produces FILLED uniform regions (not just borders).
+    Text detector for MRC: conservative binarization is preferred.
+    Uses Sauvola (manual/auto) or Adaptive Mean based on params.
     """
-    win = ensure_odd(int(p["window"]), 3)
-    std_th = float(p["stddev"])
+    text_mode = int(p.get("text_mode", 0))
+    if text_mode == 1:
+        win = ensure_odd(int(p.get("mean_window", 31)), 3)
+        C = int(p.get("mean_C", 10))
+        return cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, win, C
+        )
 
+    if int(p.get("sauvola_auto", 0)) == 1:
+        win, k = auto_tune_sauvola(gray)
+    else:
+        win = ensure_odd(int(p.get("window", 31)), 3)
+        k = float(p.get("k", 0.2))
+    R = float(p.get("R", 128.0))
     f = gray.astype(np.float32)
     mean = cv2.boxFilter(f, cv2.CV_32F, (win, win))
     sq = cv2.boxFilter(f * f, cv2.CV_32F, (win, win))
     std = np.sqrt(np.maximum(sq - mean * mean, 0.0))
-
-    mask = (std <= std_th).astype(np.uint8) * 255  # uniform -> FG
-
-    # Fill holes inside uniform components (binary hole filling)
-    inv = cv2.bitwise_not(mask)
-    flood = inv.copy()
-    cv2.floodFill(flood, None, (0, 0), 255)
-    holes = cv2.bitwise_not(flood)
-    filled = cv2.bitwise_or(mask, holes)
-    return filled
+    th = mean * (1 + k * ((std / max(R, 1e-6)) - 1))
+    return (f < th).astype(np.uint8) * 255  # dark -> FG
 
 
-def method_mser_text(gray, p):
-    delta = int(p["delta"])
-    min_area = int(p["min_area"])
-    max_area = int(p["max_area"])
-    max_variation = float(p["max_variation"])
-    min_diversity = float(p["min_diversity"])
-    invert = int(p["invert"])
+def detect_lineart_mask(gray: np.ndarray, p: Dict[str, Any]) -> np.ndarray:
+    """
+    Line-art detector for thin graphics and frames using classic CV.
+    """
+    low = int(p.get("line_low", 50))
+    high = int(p.get("line_high", 150))
+    edges = cv2.Canny(gray, low, high)
 
-    img = 255 - gray if invert else gray
-    mser = cv2.MSER_create(delta, min_area, max_area, max_variation, min_diversity)
-    regions, _ = mser.detectRegions(img)
+    k = ensure_odd(int(p.get("line_kernel", 3)), 1)
+    if k > 1:
+        horiz = cv2.getStructuringElement(cv2.MORPH_RECT, (k, 1))
+        vert = cv2.getStructuringElement(cv2.MORPH_RECT, (1, k))
+        edges = cv2.dilate(edges, horiz, iterations=1)
+        edges = cv2.dilate(edges, vert, iterations=1)
 
-    mask = np.zeros_like(gray, dtype=np.uint8)
-    if not regions:
-        return mask
+    dilate_k = ensure_odd(int(p.get("line_dilate", 3)), 1)
+    if dilate_k > 1:
+        se = cv2.getStructuringElement(cv2.MORPH_RECT, (dilate_k, dilate_k))
+        edges = cv2.dilate(edges, se, iterations=1)
 
-    for region in regions:
-        poly = region.reshape(-1, 1, 2)
-        cv2.fillPoly(mask, [poly], 255)
-    return mask
+    return (edges > 0).astype(np.uint8) * 255
+
+
+def combine_fg_masks(text_mask: np.ndarray,
+                     line_mask: np.ndarray,
+                     p: Dict[str, Any]) -> np.ndarray:
+    """
+    Combine detectors for a stable FG mask (MRC compression oriented).
+    """
+    combined = cv2.bitwise_or(text_mask, line_mask)
+    close_k = ensure_odd(int(p.get("close_kernel", 3)), 1)
+    if close_k > 1:
+        se = cv2.getStructuringElement(cv2.MORPH_RECT, (close_k, close_k))
+        combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, se, iterations=1)
+    open_k = ensure_odd(int(p.get("open_kernel", 1)), 1)
+    if open_k > 1:
+        se = cv2.getStructuringElement(cv2.MORPH_RECT, (open_k, open_k))
+        combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, se, iterations=1)
+    return combined
+
+
+def method_text_lineart(gray, p):
+    """
+    Combined text + line-art foreground detection for MRC compression.
+    Uses separate detectors and merges them conservatively.
+    """
+    text_mask = detect_text_mask(gray, p)
+    line_mask = detect_lineart_mask(gray, p)
+    return combine_fg_masks(text_mask, line_mask, p)
 
 
 # =========================================================
@@ -197,46 +200,24 @@ METHODS: List[MethodSpec] = [
         ParamSpec("k", "k", "float", -1.0, 1.0, -0.2, 0.01, 100),
     ], method_niblack),
 
-    MethodSpec("Sobel edges → threshold", [
-        ParamSpec("kernel", "Sobel kernel (odd)", "int", 3, 31, 3, 2),
-        ParamSpec("threshold", "Edge threshold", "int", 0, 255, 40, 1),
-    ], method_sobel_edges),
-
-    MethodSpec("Laplacian magnitude → threshold", [
-        ParamSpec("threshold", "Response threshold", "int", 0, 255, 35, 1),
-    ], method_laplacian),
-
-    MethodSpec("DoG → threshold", [
-        ParamSpec("sigma1", "Sigma 1", "float", 0.3, 10.0, 1.0, 0.05, 100),
-        ParamSpec("sigma2", "Sigma 2", "float", 0.3, 20.0, 2.0, 0.05, 100),
-        ParamSpec("threshold", "Response threshold", "int", 0, 255, 20, 1),
-    ], method_dog),
-
     MethodSpec("Canny edges", [
         ParamSpec("low", "Low threshold", "int", 0, 255, 40, 1),
         ParamSpec("high", "High threshold", "int", 0, 255, 120, 1),
     ], method_canny),
 
-    MethodSpec("Morph gradient → threshold", [
-        ParamSpec("kernel", "Kernel size (odd)", "int", 3, 31, 3, 2),
-        ParamSpec("threshold", "Response threshold", "int", 0, 255, 30, 1),
-    ], method_morph_gradient),
-
-    MethodSpec("Top-percent energy (Laplacian)", [
-        ParamSpec("percent", "Keep top (%)", "float", 0.1, 50.0, 5.0, 0.1, 10),
-    ], method_top_percent_energy),
-
-    MethodSpec("Low-variance filled geometry", [
-        ParamSpec("window", "Window size (odd)", "int", 3, 101, 31, 2),
-        ParamSpec("stddev", "StdDev threshold", "float", 0.5, 50.0, 6.0, 0.1, 10),
-    ], method_low_variance_filled),
-
-    MethodSpec("MSER text regions", [
-        ParamSpec("delta", "Delta", "int", 1, 20, 5, 1),
-        ParamSpec("min_area", "Min area", "int", 10, 10000, 60, 10),
-        ParamSpec("max_area", "Max area", "int", 100, 200000, 8000, 100),
-        ParamSpec("max_variation", "Max variation", "float", 0.1, 1.0, 0.25, 0.01, 100),
-        ParamSpec("min_diversity", "Min diversity", "float", 0.0, 1.0, 0.2, 0.01, 100),
-        ParamSpec("invert", "Invert (1=detect bright)", "int", 0, 1, 0, 1),
-    ], method_mser_text),
+    MethodSpec("Text + Lineart (MRC)", [
+        ParamSpec("text_mode", "Text mode (0=Sauvola,1=AdaptiveMean)", "int", 0, 1, 0, 1),
+        ParamSpec("sauvola_auto", "Sauvola auto (1=auto)", "int", 0, 1, 1, 1),
+        ParamSpec("window", "Sauvola window (odd)", "int", 3, 101, 31, 2),
+        ParamSpec("k", "Sauvola k", "float", 0.05, 0.5, 0.25, 0.01, 100),
+        ParamSpec("R", "Sauvola R", "float", 1.0, 255.0, 128.0, 1.0, 10),
+        ParamSpec("mean_window", "Adaptive mean window (odd)", "int", 3, 101, 31, 2),
+        ParamSpec("mean_C", "Adaptive mean C", "int", -50, 50, 10, 1),
+        ParamSpec("line_low", "Lineart Canny low", "int", 0, 255, 50, 1),
+        ParamSpec("line_high", "Lineart Canny high", "int", 0, 255, 150, 1),
+        ParamSpec("line_kernel", "Line emphasis kernel", "int", 1, 31, 3, 2),
+        ParamSpec("line_dilate", "Line dilate", "int", 1, 31, 3, 2),
+        ParamSpec("close_kernel", "Combine close kernel", "int", 1, 15, 3, 2),
+        ParamSpec("open_kernel", "Combine open kernel", "int", 1, 15, 1, 2),
+    ], method_text_lineart),
 ]
